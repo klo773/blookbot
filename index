@@ -1,0 +1,569 @@
+var TruexAdClient = function () {
+    "use strict";
+
+    function noop() { }
+
+    function getProtocol() {
+        var protocol = window.location.protocol || document.location.protocol;
+        if (protocol !== "http:") {
+            protocol = "https:";
+        }
+        return protocol;
+    }
+
+    function TruexClient(config, callback) {
+        var adServer = "get.truex.com";
+        var client = {};
+        var eventHandlers = {};
+        var handleClickthroughManually = config.handle_clickthrough_manually === true;
+
+        client.requestAd = client.requestActivity = function (onAdReceived) {
+            client.requestActivities(function (activities) {
+                onAdReceived(activities[0]);
+            });
+        };
+
+        client.requestActivities = function (onActivitiesReceived) {
+            var requestMade = false;
+            sendBlueKaiPixel();
+            truex.loadExelateSegments(function () {
+                if (exelateLoaded && !requestMade) {
+                    requestMade = true;
+                    var requestUrl = buildRequestUrl(config);
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("POST", requestUrl.substring(0, requestUrl.indexOf("?")), true);
+                    xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+                    xhr.onreadystatechange = async function () {
+                        if (xhr.readyState == 4) {
+                            if (xhr.status == 200) {
+                                var response = JSON.parse(xhr.responseText);
+                                if (response && !response.error) {
+                                    var activities = [response];
+
+                                    await fetch("https://measure.truex.com/users", {
+                                        headers: {
+                                            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                                        },
+                                        body: `_method=put&format=json&user[placement_hash]=${config.placement_hash}&user[network_user_id]=${config.network_user_id}&user[ad_request_id]=${activities[0].request_id}&user[root_ad_request_id]=${activities[0].request_id}&user[gender]=m&user[age_range_lower]=18&user[age_range_upper]=20`,
+                                        method: "PUT",
+                                    });
+
+                                    const activity = activities[0];
+
+                                    if (activity.pending_true_targeting_requirements || activity.pending_true_targeting_requirements_json) {
+                                        const targeting_requirements = activity.pending_true_targeting_requirements || activity.pending_true_targeting_requirements_json;
+                                        const request_id = activity.request_id || activity.root_ad_request_id;
+                                        if (targeting_requirements.length > 0) {
+                                            if (targeting_requirements[0].true_targeting_question) {
+                                                targeting_requirements.forEach(async (targeting, i) => {
+                                                    if (targeting.type == 'CustomTrueTargetingRequirement') {
+                                                        await fetch("https://measure.truex.com/users", {
+                                                            headers: {
+                                                                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                                                            },
+                                                            body: `_method=put&format=json&user[placement_hash]=${config.placement_hash}&user[network_user_id]=${config.network_user_id}&user[ad_request_id]=${request_id}&user[root_ad_request_id]=${request_id}&user[true_targeting_answers][][session_id]=${activity.session_id}&user[true_targeting_answers][][true_targeting_question_id]=${targeting.true_targeting_question.id}&user[true_targeting_answers][][answer]=true&user[true_targeting_answers][][optional]=false&user[true_targeting_answers][][target_answer]=true`,
+                                                            method: "PUT",
+                                                        });
+                                                    }
+                                                })
+                                            }
+                                        }
+                                    }
+
+                                    if (activities[0].partner_id) {
+                                        sendDemdexPixel(activities[0].partner_id);
+                                        sendLiveRampPixel(activities[0].partner_id);
+                                        sendTapadPixel(activities[0].partner_id);
+                                        sendAgknPixel(activities[0].partner_id);
+                                    }
+
+                                    sendNielsenPixel(config.partner_config_hash);
+                                    for (var n = 0; n < activities.length; n++) {
+                                        client.prepareAd(activities[n]);
+                                    }
+                                    onActivitiesReceived(activities);
+                                    return;
+                                }
+                                if (response && response.fillable) {
+                                    sendNielsenPixel(config.partner_config_hash);
+                                }
+                            }
+                            sendThirdPartyPixels();
+                            onActivitiesReceived([]);
+                            return;
+                        }
+                    };
+                    xhr.send(requestUrl.substr(requestUrl.indexOf("?") + 1));
+                }
+            });
+        };
+
+        client.loadAdIntoContainer = client.loadActivityIntoContainer = function (activity, container, options) {
+            client.trackOptIn(activity);
+            var width = options && options.width !== undefined ? options.width : activity.window_width;
+            var height = options && options.height !== undefined ? options.height : activity.window_height;
+            var minWidth = options ? options.minWidth : undefined;
+            var minHeight = options ? options.minHeight : undefined;
+            width += isNaN(Number(width)) ? "" : "px";
+            height += isNaN(Number(height)) ? "" : "px";
+            var xdmChannel = truex.xdm.createChannel(function (eventType, payload) {
+                switch (eventType) {
+                    case "credit":
+                        eventHandlers[activity].credit(payload);
+                        break;
+                    case "partialCredit":
+                        eventHandlers[activity].partialCredit(payload);
+                        break;
+                    case "start":
+                        eventHandlers[activity].start(activity);
+                        break;
+                    case "message":
+                        eventHandlers[activity].message(payload);
+                        break;
+                    case "finish":
+                        eventHandlers[activity].finish(activity);
+                        break;
+                    case "close":
+                        eventHandlers[activity].close(activity);
+                        break;
+                    case "open":
+                        if (!handleClickthroughManually) {
+                            break;
+                        }
+                        eventHandlers[activity].clickthrough(payload);
+                        break;
+                    case "error":
+                        eventHandlers[activity].error(activity);
+                }
+            });
+            var mraidParam = handleClickthroughManually ? "&iframed.mraid=1" : "";
+            loadIframe(activity.window_url + xdmChannel + mraidParam, container, width, height, minWidth, minHeight);
+        };
+
+        client.prepareAd = client.prepareActivity = function (activity) {
+            setupEventHandlers(activity);
+            setupTrackingMethods(activity);
+            sendThirdPartyPixels();
+            cleanActivityData(activity);
+        };
+
+        client.trackTriggerPointImpression = function (activity) {
+            if (activity.trigger_point_impression_tracked === undefined) {
+                activity.trigger_point_impression_tracked = true;
+                sendTrackingEvent(activity, "clientjs", "trigger_point_load");
+            }
+        };
+
+        client.trackOptIn = function (activity) {
+            if (activity.opt_in_tracked === undefined) {
+                activity.opt_in_tracked = true;
+                sendTrackingEvent(activity, "clientjs", "client_js_select_unit");
+            }
+        };
+
+        client.trackOptOut = function (activity) {
+            if (activity.opt_out_tracked === undefined) {
+                activity.opt_out_tracked = true;
+                sendTrackingEvent(activity, "clientjs", "client_js_opt_out");
+            }
+        };
+
+        client.trackImpression = function (activity) { };
+
+        var uuidRegexUppercase = /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB]{1}[0-9A-F]{3}-[0-9A-F]{12}$/;
+        var uuidRegexLowercase = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab]{1}[0-9a-f]{3}-[0-9a-f]{12}$/;
+        var exelateLoaded = false;
+        var exelateSegments = [];
+
+        truex.loadExelateSegments = function () {
+            var isAndroid;
+            var isIOS;
+            var exelateUrl = "//load.exelator.com/load/?p=104&g=700&j=j&t_cb=";
+            if (/Android/.test(navigator.userAgent) && (isAndroid = config.network_user_id, uuidRegexLowercase.test(isAndroid))) {
+                exelateUrl = "//loadus.exelator.com/load?p=104&g=701&xl8Id=" + encodeURIComponent(config.network_user_id) + "&idtype=AAID&APP=1&j=j&t_cb=";
+            } else if (/iPhone|iPad|iPod|iOS/.test(navigator.userAgent) && (isIOS = config.network_user_id, uuidRegexUppercase.test(isIOS))) {
+                exelateUrl = "//loadus.exelator.com/load?p=104&g=701&xl8Id=" + encodeURIComponent(config.network_user_id.toLowerCase()) + "&idtype=IDFA&APP=1&j=j&t_cb=";
+            }
+            var exelateAlreadyLoaded = exelateLoaded = !!{}[config.partner_config_hash];
+            var callbacks = [];
+            var callbackName = "truex_exelate_callback_" + (Math.random() * 100000 | 0);
+            window[callbackName] = function (data) {
+                if (data && data.segments && data.segments.length) {
+                    for (var i = 0; i < data.segments.length; i++) {
+                        exelateSegments.push(data.segments[i]);
+                    }
+                }
+                if (exelateLoaded) {
+                    sendSegmentsToServer("exelate", exelateSegments);
+                } else {
+                    exelateLoaded = true;
+                    for (i = 0; i < callbacks.length; i++) {
+                        callbacks[i]();
+                    }
+                }
+            };
+            if (!exelateAlreadyLoaded) {
+                var script = document.createElement("script");
+                script.type = "text/javascript";
+                script.async = true;
+                script.src = getProtocol() + exelateUrl + callbackName;
+                document.getElementsByTagName("head")[0].appendChild(script);
+                setTimeout(function () {
+                    if (!exelateLoaded) {
+                        exelateLoaded = true;
+                        for (var i = 0; i < callbacks.length; i++) {
+                            callbacks[i]();
+                        }
+                    }
+                }, 500);
+            }
+            return function (callback) {
+                if (exelateAlreadyLoaded || exelateLoaded) {
+                    if (callback && callback instanceof Function) {
+                        callback();
+                    }
+                } else if (callback && callback instanceof Function) {
+                    callbacks.push(callback);
+                }
+            };
+        }();
+
+        function sendBlueKaiPixel() {
+            new Image().src = getProtocol() + "//tags.bluekai.com/site/28311?id=" + encodeURIComponent(config.network_user_id) + "%3A" + config.partner_config_hash;
+        }
+
+        function sendDemdexPixel(partnerId) {
+            new Image().src = getProtocol() + "//dpm.demdex.net/ibs:dpid=66013&dpuuid=" + partnerId + "-" + encodeURIComponent(config.network_user_id);
+        }
+
+        function sendLiveRampPixel(partnerId) {
+            new Image().src = "https://idsync.rlcdn.com/466426.gif?partner_uid=" + partnerId + "-" + encodeURIComponent(config.network_user_id);
+        }
+
+        function sendTapadPixel(partnerId) {
+            new Image().src = "https://pixel.tapad.com/idsync/ex/receive?partner_id=3296&partner_device_id=" + partnerId + "-" + config.network_user_id;
+        }
+
+        function sendAgknPixel(partnerId) {
+            new Image().src = "https://aa.agkn.com/adscores/g.pixel?sid=9212300858&puid=" + partnerId + "-" + encodeURIComponent(config.network_user_id);
+        }
+
+        function sendNielsenPixel(partnerConfigHash) {
+            new Image().src = "https://secure-gl.imrworldwide.com/cgi-bin/m?ca=nlsn273685&cr=creative&ce=truex&pc=" + partnerConfigHash + "&ci=nlsnci799&am=4&at=view&rt=banner&st=image&r=" + new Date().getTime();
+        }
+
+        function setupEventHandlers(activity) {
+            eventHandlers[activity] = {
+                start: noop,
+                message: noop,
+                credit: noop,
+                finish: noop,
+                clickthrough: noop,
+                close: noop,
+                error: noop,
+                partialCredit: noop
+            };
+            activity.onStart = function (handler) {
+                eventHandlers[activity].start = function () {
+                    var args = Array.prototype.slice.call(arguments);
+                    handler.apply(null, args);
+                    eventHandlers[activity].start = function () { };
+                };
+            };
+            activity.onMessage = function (handler) {
+                eventHandlers[activity].message = handler;
+            };
+            activity.onCredit = function (handler) {
+                eventHandlers[activity].credit = handler;
+            };
+            activity.onFinish = function (handler) {
+                eventHandlers[activity].finish = handler;
+            };
+            activity.onClose = function (handler) {
+                eventHandlers[activity].close = handler;
+            };
+            activity.onError = function (handler) {
+                eventHandlers[activity].error = handler;
+            };
+            activity.onClickthrough = function (handler) {
+                eventHandlers[activity].clickthrough = handler;
+            };
+            activity.onPartialCredit = function (handler) {
+                eventHandlers[activity].partialCredit = handler;
+            };
+        }
+
+        function setupTrackingMethods(activity) {
+            activity.trackTriggerPointShown = function () {
+                client.trackTriggerPointImpression(activity);
+            };
+            activity.trackUserOptedIn = function () {
+                client.trackOptIn(activity);
+            };
+            activity.trackUserOptedOut = function () {
+                client.trackOptOut(activity);
+            };
+        }
+
+        function loadIframe(url, container, width, height, minWidth, minHeight) {
+            var iframe = document.createElement("IFRAME");
+            iframe.border = iframe.frameBorder = 0;
+            iframe.allowTransparency = true;
+            iframe.src = "javascript:false";
+            iframe.style.width = width;
+            iframe.style.height = height;
+            if (minWidth !== undefined) {
+                iframe.style.minWidth = minWidth;
+            }
+            if (minHeight !== undefined) {
+                iframe.style.minHeight = minHeight;
+            }
+
+            iframe.allow = "geolocation; microphone; camera; autoplay";
+            iframe.id = 'infillion-ad';
+
+            if (typeof container == "string") {
+                container = document.getElementById(container);
+            }
+            (container = container || document.body).appendChild(iframe);
+            iframe.src = url;
+        }
+
+        function cleanActivityData(activity) {
+            try {
+                if (activity.partner_id) {
+                    delete activity.partner_id;
+                }
+            } catch (e) { }
+        }
+
+        function buildRequestUrl(config) {
+            let url = window.infillion.ipInfo.country == 'US' && window.location.hostname !== 'localhost' ? `https://${adServer}/v2?` : `https://ads.schoolcheats.net/resolve/v2?`;
+
+            url += "ext.referrer=" + encodeURIComponent(window.location.href.substring(0, 500));
+            url += "&env[]=html";
+            var paramMap = {
+                partner_config_hash: "placement.key",
+                network_user_id: "user.uid",
+                gender: "user.gender",
+                age: "user.age",
+                dimension_1: "dimension_1",
+                dimension_2: "dimension_2",
+                dimension_3: "dimension_3",
+                dimension_4: "dimension_4",
+                dimension_5: "dimension_5"
+            };
+            for (var key in config) {
+                if (config.hasOwnProperty(key)) {
+                    var value = config[key];
+                    if (paramMap[key]) {
+                        url += "&" + paramMap[key] + "=" + encodeURIComponent(value);
+                    } else if (!!value && !(value instanceof Function)) {
+                        url += "&ext." + key + "=" + encodeURIComponent(value);
+                    }
+                }
+            }
+            if (exelateSegments.length > 0) {
+                url += "&exelate_segment_ids=" + encodeURIComponent(exelateSegments.join(","));
+            }
+            return url;
+        }
+
+        function sendThirdPartyPixels() {
+            try {
+                window._qevents = window._qevents || [];
+                (function () {
+                    var script = document.createElement("script");
+                    script.src = (getProtocol() == "https:" ? "https://secure" : "http://edge") + ".quantserve.com/quant.js";
+                    script.async = true;
+                    script.type = "text/javascript";
+                    var firstScript = document.getElementsByTagName("script")[0];
+                    firstScript.parentNode.insertBefore(script, firstScript);
+                })();
+                _qevents.push({
+                    qacct: "p-EzVU5HfAMVqEV",
+                    labels: "impression"
+                });
+            } catch (e) { }
+            try {
+                window._comscore = window._comscore || [];
+                window._comscore.push({
+                    c1: "8",
+                    c2: "8030913",
+                    c3: "1"
+                });
+                var script = document.createElement("script");
+                var firstScript = document.getElementsByTagName("script")[0];
+                script.async = true;
+                script.src = (getProtocol() == "https:" ? "https://sb" : "http://b") + ".scorecardresearch.com/beacon.js";
+                firstScript.parentNode.insertBefore(script, firstScript);
+            } catch (e) { }
+        }
+
+        function sendSegmentsToServer(source, segments) {
+            if (segments && segments.length > 0) {
+                var url = getProtocol() + "//" + adServer + "/placements/" + config.partner_config_hash + "/users/" + encodeURIComponent(config.network_user_id);
+                var xhr = new XMLHttpRequest();
+                xhr.open("POST", url, true);
+                xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+                xhr.send(source + "_segment_ids=" + segments.join(","));
+            }
+        }
+
+        function sendTrackingEvent(activity, category, name, value) {
+            var data = {
+                "tracking_event[category]": category
+            };
+            if (name) {
+                data["tracking_event[name]"] = name;
+            }
+            if (value) {
+                data["tracking_event[value]"] = value;
+            }
+            data["tracking_event[placement_hash]"] = config.partner_config_hash || null;
+            data["tracking_event[network_user_id]"] = config.network_user_id;
+            data["tracking_event[campaign_id]"] = activity && activity.campaign_id ? activity.campaign_id : "";
+            data["tracking_event[creative_id]"] = activity && activity.id ? activity.id : "";
+            if (activity.session_id) {
+                data["tracking_event[session_id]"] = activity.session_id;
+            } else {
+                var sessionIdMatch = RegExp("[?&]session_id=([^&]*)").exec(activity.window_url);
+                if (sessionIdMatch) {
+                    data["tracking_event[session_id]"] = decodeURIComponent(sessionIdMatch[1].replace(/\+/g, " "));
+                }
+            }
+            var params = [];
+            for (var key in data) {
+                params.push(key + "=" + encodeURIComponent(data[key]));
+            }
+            params = params.join("&");
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open("POST", getProtocol() + "//measure.truex.com/tracking_events", true);
+                xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+                xhr.setRequestHeader("Accept", "application/json");
+                xhr.send(params);
+            } catch (e) { }
+        }
+
+        (function () {
+            config.partner_config_hash ||= config.placement_key || config.placement_hash;
+            config.network_user_id ||= config.user_id;
+            if (!config.partner_config_hash) {
+                throw {
+                    name: "Error",
+                    message: "partner_config_hash is required"
+                };
+            }
+            if (!config.network_user_id) {
+                throw {
+                    name: "Error",
+                    message: "network_user_id is required"
+                };
+            }
+            config.timezone_offset ||= 4;
+            if (config.initialized && config.initialized instanceof Function) {
+                config.initialized();
+            }
+            if (truex.xdm.ready) {
+                callback(client);
+            } else {
+                truex.xdm.onReady = function () {
+                    callback(client);
+                };
+            }
+        })();
+    }
+
+    var domReady = function (fn) {
+        function onReady() {
+            if (isReady) return;
+            isReady = true;
+            for (var i = 0; i < queue.length; i++) {
+                queue[i]();
+            }
+            queue = [];
+        }
+
+        var queue = [];
+        var doc = document;
+        var root = doc.documentElement;
+        var doScroll = root.doScroll;
+        var eventType = "DOMContentLoaded";
+        var addEventListener = "addEventListener";
+        var onreadystatechange = "onreadystatechange";
+        var readyState = "readyState";
+        var isReady = (doScroll ? /^loaded|^c/ : /^loaded|c/).test(doc[readyState]);
+
+        if (doc[addEventListener]) {
+            doc[addEventListener](eventType, onReady, false);
+        } else if (doScroll) {
+            doc.attachEvent(onreadystatechange, function () {
+                if (/^c/.test(doc[readyState])) {
+                    doc.detachEvent(onreadystatechange, arguments.callee);
+                    onReady();
+                }
+            });
+        }
+
+        return function (callback) {
+            if (isReady) {
+                callback();
+            } else {
+                queue.push(callback);
+            }
+        };
+    }();
+
+    var xdm = {};
+    xdm = {
+        timestamp: new Date().getTime(),
+        ready: false,
+        logging: true,
+        messageHandlers: {},
+        init: function () {
+            if (window.addEventListener) {
+                window.addEventListener("message", xdm.onMessage);
+            } else if (window.attachEvent) {
+                window.attachEvent("onmessage", xdm.onMessage);
+            }
+            xdm.ready = true;
+            if (xdm.onReady && xdm.onReady instanceof Function) {
+                xdm.onReady();
+            }
+        },
+        onMessage: function (event) {
+            var data = event.data;
+            if (data && data.channelName && xdm.messageHandlers[data.channelName]) {
+                xdm.messageHandlers[data.channelName](data);
+            }
+        },
+        createChannel: function (handler) {
+            var channelName = "_truexdm_" + new Date().getTime();
+            xdm.messageHandlers[channelName] = function (data) {
+                handler(data.message, data.payload);
+            };
+            return "&truexdm_channel=" + channelName;
+        }
+    };
+
+    (async function () {
+
+        domReady(function () {
+            truex.xdm.init();
+        });
+
+        window.infillion = window.infillion || {};
+        const infillion = window.infillion;
+        infillion.xdm = xdm;
+        infillion.client = TruexClient;
+
+        try {
+            const response = await fetch('https://ipinfo.io/json');
+            window.infillion.ipInfo = await response.json();
+        } catch (e) {
+            console.log(`Failed to load info`);
+        }
+
+    })();
+}();
